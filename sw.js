@@ -1,5 +1,5 @@
-// Offline support: serve the app from cache, refresh it from the network in the background.
-const CACHE = 'mordisco-v3';
+// Offline support: always try the network first so updates arrive at once; fall back to the cache without connection.
+const CACHE = 'mordisco-v4';
 const SHELL = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -12,14 +12,17 @@ self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
+  if (url.origin !== location.origin) return;
   const isPage = req.mode === 'navigate';
-  if (url.origin !== location.origin && !url.hostname.endsWith('gstatic.com') && !url.hostname.endsWith('googleapis.com')) return;
+  const key = isPage ? 'index.html' : url.pathname.replace(/^.*\//, '') || 'index.html';
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);
-    const key = isPage ? 'index.html' : req;
-    const hit = await cache.match(key, { ignoreSearch: isPage });
-    const net = fetch(req).then(res => { if (res.ok) cache.put(key, res.clone()); return res; }).catch(() => null);
-    if (hit) { e.waitUntil(net); return hit; }
-    return (await net) || new Response('Sin conexión', { status: 503 });
+    try {
+      const res = await fetch(req, { cache: 'no-cache' });
+      if (res.ok) cache.put(key, res.clone());
+      return res;
+    } catch {
+      return (await cache.match(key)) || (await cache.match(req, { ignoreSearch: true })) || new Response('Sin conexión', { status: 503 });
+    }
   })());
 });
