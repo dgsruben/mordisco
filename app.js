@@ -299,10 +299,10 @@ async function sendToGPT(prompt, file) {
 
 /* ---------- Gemini: the AI inside the app (free tier, your own key, stored only on this phone) ---------- */
 // used only if Google's model list can't be read; the app normally asks which models this key can use
-const GEM_MODELS = { fast: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-flash-latest', 'gemini-3-flash-preview'], precise: ['gemini-3.1-pro-preview', 'gemini-pro-latest', 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-flash-latest'] };
+const GEM_MODELS = { fast: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-flash-latest', 'gemini-3.5-flash-lite'], precise: ['gemini-3.1-pro-preview', 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-flash-latest', 'gemini-3.5-flash-lite'] };
 async function gemModels(signal) {
   const p = S.profile;
-  if (p.aiModels && Date.now() - p.aiModels.at < 3 * 864e5) return p.aiModels;
+  if (p.aiModels?.v === 2 && Date.now() - p.aiModels.at < 3 * 864e5) return p.aiModels;
   let res;
   const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 8000), stop = () => ctl.abort();
   signal?.addEventListener('abort', stop);
@@ -314,13 +314,15 @@ async function gemModels(signal) {
   const j = await res.json().catch(() => ({}));
   const ids = (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
     .map(m => String(m.name).replace(/^models\//, ''))
-    .filter(id => /^gemini-/.test(id) && !/(lite|image|tts|live|embed|audio|robotics|computer|nano|learnlm|customtools)/.test(id));
+    .filter(id => /^gemini-/.test(id) && !/(image|tts|live|embed|audio|robotics|computer|nano|learnlm|customtools)/.test(id));
   const ver = id => parseFloat((id.match(/^gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
   const score = id => ver(id) * 10 - (/preview|exp/.test(id) ? 1 : 0);
-  const flash = ids.filter(id => /flash/.test(id)).sort((a, b) => score(b) - score(a));
-  const pro = ids.filter(id => /pro/.test(id)).sort((a, b) => score(b) - score(a));
+  const byScore = (a, b) => score(b) - score(a);
+  const flash = ids.filter(id => /flash/.test(id) && !/lite/.test(id)).sort(byScore);
+  const lite = ids.filter(id => /flash-lite/.test(id)).sort(byScore).slice(0, 1);   // last resort: usually has room when the rest are busy
+  const pro = ids.filter(id => /pro/.test(id)).sort(byScore);
   if (!flash.length && !pro.length) return GEM_MODELS;
-  p.aiModels = { fast: flash.slice(0, 3), precise: [...pro.slice(0, 2), ...flash.slice(0, 2)], at: Date.now() };
+  p.aiModels = { v: 2, fast: [...flash.slice(0, 3), ...lite], precise: [...pro.slice(0, 2), ...flash.slice(0, 3), ...lite], at: Date.now() };
   if (!p.aiModels.fast.length) p.aiModels.fast = pro.slice(0, 2);
   saveProfile();
   return p.aiModels;
@@ -344,13 +346,20 @@ async function gemini(parts, { json = true, signal, precise = S.profile.aiPrecis
   if (!order.length) order = list[mode];
   const bench = (m, ms) => { p.aiSkip = { ...(p.aiSkip || {}), [m]: Date.now() + ms }; saveProfile(); };
   S.tried = [];
-  for (const model of order) {
+  const deadline = Date.now() + 60000, wait = ms => new Promise(r => setTimeout(r, ms));
+  const attempts = order.flatMap(m => /pro/.test(m) ? [[m, 0]] : [[m, 0], [m, 1], [m, 2]]);   // flash models get 2 quick retries
+  for (const [model, retry] of attempts) {
     if (signal?.aborted) throw { code: 'cancelled' };
+    if (Date.now() > deadline) { lastErr = { code: 'timeout' }; break; }
+    if (retry) {
+      if (!['busy', 'network'].includes(lastErr.code) || S.tried.at(-1) !== model) continue;   // retry only after a transient failure of this model
+      await wait(retry * 1500);
+    }
     S.tried.push(model); S.trying = model;
     const ctl = new AbortController(), stop = () => ctl.abort();
     signal?.addEventListener('abort', stop);
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, /pro/.test(model) ? 40000 : 30000);
+    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, Math.min(/pro/.test(model) ? 40000 : 30000, Math.max(5000, deadline - Date.now())));
     try {
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -366,16 +375,18 @@ async function gemini(parts, { json = true, signal, precise = S.profile.aiPrecis
       }
       const msg = body.error?.message || '';
       if (res.status === 403 || (res.status === 400 && /api key/i.test(msg))) throw { code: 'badkey' };
-      lastErr = { code: res.status === 429 ? 'quota' : res.status === 404 ? 'nomodel' : 'http', msg };
+      lastErr = { code: res.status === 429 ? 'quota' : res.status === 404 ? 'nomodel' : res.status >= 500 ? 'busy' : 'http', msg };
       if (res.status === 429 || res.status === 404) bench(model, 12 * 3600e3);
-      // 404 (model not available), 429 (quota for this model) or 5xx: try the next model
+      // 404 (model not available), 429 (quota for this model), 503 (overloaded): retry or try the next model
     } catch (e) {
       if (e.code) throw e;
       if (signal?.aborted) throw { code: 'cancelled' };
-      if (timedOut) { lastErr = { code: 'timeout' }; bench(model, 6 * 3600e3); continue; }
-      throw { code: 'network' };
+      if (timedOut) { lastErr = { code: 'timeout' }; bench(model, 3600e3); continue; }
+      if (!navigator.onLine) throw { code: 'network' };
+      lastErr = { code: 'network' };   // Google sometimes drops overloaded requests without an answer: treat as transient
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', stop); }
   }
+  if (lastErr.code === 'network' && S.tried.length > 1) lastErr = { code: 'busy' };
   if (lastErr.code === 'nomodel') { S.profile.aiModels = null; saveProfile(); }   // re-read Google's list next time
   throw lastErr;
 }
@@ -387,6 +398,7 @@ function aiError(e) {
     network: 'Sin conexión con Gemini. Revisa internet.',
     badjson: 'La respuesta salió mal formada. Reintenta.',
     timeout: 'Gemini no ha respondido a tiempo. Reintenta (ahora irá directo al modelo rápido) o usa ChatGPT.',
+    busy: 'Los servidores de Gemini están saturados ahora mismo. Reintenta en un minuto o usa ChatGPT.',
     empty: 'Gemini no ha devuelto nada. Reintenta o descríbelo con texto.',
     nomodel: 'Google no ha aceptado ningún modelo con tu clave. Toca Probar otra vez en un minuto; si sigue, revisa que la clave sea de aistudio.google.com.'
   })[e?.code] || 'Algo ha fallado con Gemini. Reintenta o usa ChatGPT.';
