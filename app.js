@@ -298,7 +298,30 @@ async function sendToGPT(prompt, file) {
 }
 
 /* ---------- Gemini: the AI inside the app (free tier, your own key, stored only on this phone) ---------- */
-const GEM_MODELS = { fast: ['gemini-flash-latest', 'gemini-2.5-flash'], precise: ['gemini-pro-latest', 'gemini-2.5-pro', 'gemini-flash-latest', 'gemini-2.5-flash'] };
+// used only if Google's model list can't be read; the app normally asks which models this key can use
+const GEM_MODELS = { fast: ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-flash-latest', 'gemini-3-flash-preview'], precise: ['gemini-3.1-pro-preview', 'gemini-pro-latest', 'gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-flash-latest'] };
+async function gemModels(signal) {
+  const p = S.profile;
+  if (p.aiModels && Date.now() - p.aiModels.at < 3 * 864e5) return p.aiModels;
+  let res;
+  try { res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': p.geminiKey }, signal }); }
+  catch (e) { if (e.name === 'AbortError') throw { code: 'cancelled' }; return GEM_MODELS; }
+  if (res.status === 401 || res.status === 403) throw { code: 'badkey' };
+  if (!res.ok) { const b = await res.json().catch(() => ({})); if (/api key/i.test(b.error?.message || '')) throw { code: 'badkey' }; return GEM_MODELS; }
+  const j = await res.json().catch(() => ({}));
+  const ids = (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => String(m.name).replace(/^models\//, ''))
+    .filter(id => /^gemini-/.test(id) && !/(lite|image|tts|live|embed|audio|robotics|computer|nano|learnlm|customtools)/.test(id));
+  const ver = id => parseFloat((id.match(/^gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  const score = id => ver(id) * 10 - (/preview|exp/.test(id) ? 1 : 0);
+  const flash = ids.filter(id => /flash/.test(id)).sort((a, b) => score(b) - score(a));
+  const pro = ids.filter(id => /pro/.test(id)).sort((a, b) => score(b) - score(a));
+  if (!flash.length && !pro.length) return GEM_MODELS;
+  p.aiModels = { fast: flash.slice(0, 3), precise: [...pro.slice(0, 2), ...flash.slice(0, 2)], at: Date.now() };
+  if (!p.aiModels.fast.length) p.aiModels.fast = pro.slice(0, 2);
+  saveProfile();
+  return p.aiModels;
+}
 const hasAI = () => !!S.profile.geminiKey;
 function parseJSONLoose(t) {
   try { return JSON.parse(t); } catch {}
@@ -309,7 +332,10 @@ function parseJSONLoose(t) {
 async function gemini(parts, { json = true, signal, precise = S.profile.aiPrecise } = {}) {
   const key = S.profile.geminiKey; if (!key) throw { code: 'nokey' };
   let lastErr = { code: 'http' };
-  for (const model of precise ? GEM_MODELS.precise : GEM_MODELS.fast) {
+  const list = await gemModels(signal);
+  S.tried = [];
+  for (const model of precise ? list.precise : list.fast) {
+    S.tried.push(model);
     let res;
     try {
       res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
@@ -330,6 +356,7 @@ async function gemini(parts, { json = true, signal, precise = S.profile.aiPrecis
     lastErr = { code: res.status === 429 ? 'quota' : res.status === 404 ? 'nomodel' : 'http', msg };
     // 404 (model not available), 429 (quota for this model) or 5xx: try the next model
   }
+  if (lastErr.code === 'nomodel') { S.profile.aiModels = null; saveProfile(); }   // re-read Google's list next time
   throw lastErr;
 }
 function aiError(e) {
@@ -340,7 +367,7 @@ function aiError(e) {
     network: 'Sin conexión con Gemini. Revisa internet.',
     badjson: 'La respuesta salió mal formada. Reintenta.',
     empty: 'Gemini no ha devuelto nada. Reintenta o descríbelo con texto.',
-    nomodel: 'Tu clave no tiene acceso a los modelos de Gemini. Revisa la clave.'
+    nomodel: 'Google no ha aceptado ningún modelo con tu clave. Toca Probar otra vez en un minuto; si sigue, revisa que la clave sea de aistudio.google.com.'
   })[e?.code] || 'Algo ha fallado con Gemini. Reintenta o usa ChatGPT.';
 }
 const LOAD_MSGS = ['Reconociendo alimentos…', 'Midiendo raciones por el tamaño del plato…', 'Buscando el aceite escondido…', 'Cuadrando calorías y macros…'];
@@ -1049,14 +1076,14 @@ document.addEventListener('click', e => {
     case 'aians': { const q = dr.questions[+a.dataset.i]; analyzeAI(`${q} → ${a.dataset.a}`); break; }
     case 'aifix': { const f = $('#dFix').value.trim(); if (!f) { toast('Escribe qué hay que corregir.'); return; } analyzeAI(f); break; }
     case 'savegem': {
-      p.geminiKey = $('#pGem').value.trim(); p.aiPrecise = $('#pMode').value === '1';
+      p.geminiKey = $('#pGem').value.trim(); p.aiPrecise = $('#pMode').value === '1'; p.aiModels = null;
       saveProfile(); render(); toast(p.geminiKey ? 'Gemini guardado. Toca Probar.' : 'Gemini desactivado'); break;
     }
     case 'testgem': {
       const st = $('#gemStatus'); if (st) st.textContent = 'Probando…';
       gemini([{ text: 'Responde solo con JSON {"ok":true,"kcal":N} donde N son las kcal de una manzana mediana.' }], { precise: false })
         .then(r => { const s = $('#gemStatus'); if (s) s.textContent = `Funciona (${S.lastModel}). Una manzana ≈ ${R(num(r.kcal))} kcal.`; toast('Gemini funciona'); })
-        .catch(e => { const s = $('#gemStatus'); if (s) s.textContent = aiError(e); });
+        .catch(e => { const s = $('#gemStatus'); if (s) s.textContent = aiError(e) + (S.tried?.length ? ` (probados: ${S.tried.join(', ')}${e.msg ? ' · ' + e.msg.slice(0, 120) : ''})` : ''); });
       break;
     }
     case 'readpaste': receiveAny($('#dPaste').value); break;
