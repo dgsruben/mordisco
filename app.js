@@ -840,7 +840,7 @@ function viewProfile() {
       <li>Toca <strong>Create API key</strong> (Crear clave) y cópiala.</li>
       <li>Pégala aquí y guarda. Se queda solo en este móvil.</li>
     </ol>
-    <div class="field"><label for="pGem">Clave de Gemini</label><input id="pGem" type="password" autocomplete="off" value="${esc(p.geminiKey)}" placeholder="AIza…"></div>
+    <div class="field"><label for="pGem">Clave de Gemini</label><input id="pGem" type="password" autocomplete="off" value="${esc(p.geminiKey)}" placeholder="Pega aquí tu clave"></div>
     <div class="field"><label for="pMode">Modo</label><select id="pMode"><option value="1" ${p.aiPrecise ? 'selected' : ''}>Preciso: el mejor modelo disponible, piensa más y te pregunta dudas</option><option value="0" ${p.aiPrecise ? '' : 'selected'}>Rápido: respuesta en pocos segundos</option></select></div>
     <div class="row"><button class="btn solid" data-act="savegem">Guardar</button>${hasAI() ? '<button class="btn soft" data-act="testgem">Probar</button>' : ''}</div>
     <p class="note" id="gemStatus">${S.lastModel ? 'Último modelo usado: ' + esc(S.lastModel) + '.' : ''} En la versión gratis Google puede usar lo que envías para mejorar sus modelos. ChatGPT sigue disponible como respaldo.</p>
