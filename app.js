@@ -53,7 +53,8 @@ const PhotoDB = {
 const defaultProfile = () => ({ sex: 'm', age: 22, height: 175, weight: 82, goal: 74, pace: 0.5, proteinPerKg: 1.8,
   weekly: true, outDay: 2, outBonus: 400, calib: 0,
   fasting: { on: false, hours: 16 }, fastStart: null, fasts: [],
-  weights: [{ date: todayISO(), kg: 82 }], history: {}, recent: [], plan: null, gptUrl: '', gptReady: false });
+  weights: [{ date: todayISO(), kg: 82 }], history: {}, recent: [], plan: null, gptUrl: '', gptReady: false,
+  geminiKey: '', aiPrecise: true });
 const emptyDay = date => ({ date, meals: [], water: 0, steps: 0, exKcal: 0 });
 const S = { tab: 'hoy', date: todayISO(), profile: null, day: null, draft: null, slotFor: null, undo: null, photos: [] };
 
@@ -218,7 +219,7 @@ ${FORMAT}`;
 }
 const photoPrompt = extra => `${METHOD}\n\nAnaliza la comida de la foto que te adjunto.${extra ? '\nContexto: ' + extra : ''}\n\n${replyRules()}`;
 const textPrompt = desc => `${METHOD}\n\nAnaliza esta comida: "${desc}"\n\n${replyRules()}`;
-function planPrompt() {
+function planPrompt(asJSON) {
   const p = S.profile, t = targets(p, { steps: 7000 });
   const fast = p.fasting.on ? `\n- Hago ayuno ${p.fasting.hours}:${24 - p.fasting.hours}: todas las comidas dentro de una ventana de ${24 - p.fasting.hours} h (comida, merienda y cena; sin desayuno).` : '\n- 4 comidas al día: desayuno, comida, merienda y cena.';
   const out = p.weekly && p.outDay >= 0 ? `\n- Los ${DAYS[p.outDay]} como fuera a mediodía: pon esa comida como "Comida fuera" con unas ${R((t.kcal * 0.4 + p.outBonus) / 50) * 50} kcal y aligera el resto de ese día.` : '';
@@ -230,14 +231,17 @@ Mis objetivos por día (aproximados, ±100 kcal): ${t.kcal} kcal, mínimo ${t.p}
 - Recetas sencillas de 20 minutos o menos, ingredientes que se repitan durante la semana para no tirar comida, y alguna cocinada en tanda para varios días.
 - No tengo báscula: da las cantidades en medidas caseras (puñado, cucharada, lata, pieza, plato) con los gramos aproximados.${fast}${out}
 - Comida rica y variada. Mucha verdura y proteína en cada comida para estar saciado.
-
+` + (asJSON ? `
+Responde solo con JSON con esta forma:
+{"meals":[{"d":1,"slot":"desayuno|comida|merienda|cena","name":"nombre corto del plato","kcal":0,"p":0,"c":0,"f":0,"recipe":"ingredientes con cantidades caseras y cómo se hace, en 1-2 frases"}],"shop":["producto y cantidad para toda la semana"]}
+d: 1 = lunes ... 7 = domingo. p, c y f en gramos.` : `
 Responde en este orden:
 1. El plan día por día, con cantidades y kcal y proteína de cada comida.
 2. La lista de la compra de toda la semana, agrupada por secciones del supermercado.
 3. Este enlace en Markdown: [Cargar plan en Mordisco](${APP_URL}#CODIGO) donde CODIGO es el código de abajo.
 4. El mismo código en un bloque de código, en una sola línea.
 
-${PLAN_FORMAT}`;
+${PLAN_FORMAT}`);
 }
 function gptInstructions() {
   return `${METHOD}\n\nCuando te mande una foto de comida o te describa lo que he comido, analízala.\n\n${replyRules()}\n\nSi te pido un plan semanal, termina con un enlace [Cargar plan en Mordisco](${APP_URL}#CODIGO) y el código en un bloque, con este formato:\n${PLAN_FORMAT}\n\nSi te pregunto otra cosa sobre nutrición, contesta corto, en español de España, como un buen entrenador personal.`;
@@ -291,6 +295,129 @@ async function sendToGPT(prompt, file) {
   }
   openGPT();
   toast(copied ? (file ? 'Instrucciones copiadas. En ChatGPT adjunta la foto y pega.' : 'Copiado. Pégalo en ChatGPT.') : 'No he podido copiar. Usa tu GPT de Mordisco.');
+}
+
+/* ---------- Gemini: the AI inside the app (free tier, your own key, stored only on this phone) ---------- */
+const GEM_MODELS = { fast: ['gemini-flash-latest', 'gemini-2.5-flash'], precise: ['gemini-pro-latest', 'gemini-2.5-pro', 'gemini-flash-latest', 'gemini-2.5-flash'] };
+const hasAI = () => !!S.profile.geminiKey;
+function parseJSONLoose(t) {
+  try { return JSON.parse(t); } catch {}
+  const m = String(t).match(/[[{][\s\S]*[\]}]/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  throw { code: 'badjson' };
+}
+async function gemini(parts, { json = true, signal, precise = S.profile.aiPrecise } = {}) {
+  const key = S.profile.geminiKey; if (!key) throw { code: 'nokey' };
+  let lastErr = { code: 'http' };
+  for (const model of precise ? GEM_MODELS.precise : GEM_MODELS.fast) {
+    let res;
+    try {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.2, ...(json ? { responseMimeType: 'application/json' } : {}) } })
+      });
+    } catch (e) { throw { code: e.name === 'AbortError' ? 'cancelled' : 'network' }; }
+    if (res.ok) {
+      const j = await res.json();
+      const text = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
+      if (!text) { lastErr = { code: 'empty' }; continue; }
+      S.lastModel = model;
+      return json ? parseJSONLoose(text) : text;
+    }
+    const body = await res.json().catch(() => ({}));
+    const msg = body.error?.message || '';
+    if (res.status === 403 || (res.status === 400 && /api key/i.test(msg))) throw { code: 'badkey' };
+    lastErr = { code: res.status === 429 ? 'quota' : res.status === 404 ? 'nomodel' : 'http', msg };
+    // 404 (model not available), 429 (quota for this model) or 5xx: try the next model
+  }
+  throw lastErr;
+}
+function aiError(e) {
+  return ({
+    nokey: 'Falta tu clave de Gemini. Ponla en Perfil.',
+    badkey: 'Google no acepta la clave de Gemini. Revísala en Perfil.',
+    quota: 'Se ha acabado la cuota gratis de Gemini por ahora. Usa ChatGPT o prueba en un rato.',
+    network: 'Sin conexión con Gemini. Revisa internet.',
+    badjson: 'La respuesta salió mal formada. Reintenta.',
+    empty: 'Gemini no ha devuelto nada. Reintenta o descríbelo con texto.',
+    nomodel: 'Tu clave no tiene acceso a los modelos de Gemini. Revisa la clave.'
+  })[e?.code] || 'Algo ha fallado con Gemini. Reintenta o usa ChatGPT.';
+}
+const LOAD_MSGS = ['Reconociendo alimentos…', 'Midiendo raciones por el tamaño del plato…', 'Buscando el aceite escondido…', 'Cuadrando calorías y macros…'];
+const blobToB64 =blob => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(blob); });
+const AI_SCHEMA = `{"dish":"nombre corto del plato","confidence":"alta|media|baja","items":[{"name":"alimento y cómo está cocinado","grams":0,"kcal":0,"p":0,"c":0,"f":0,"fib":0,"sug":0,"na":0}],"notes":"qué has supuesto, en una frase","questions":["hasta 2 preguntas de sí/no cuya respuesta cambiaría las kcal más de un 15 %"],"tip":"un consejo breve para perder grasa sobre este plato"}`;
+function aiPrompt(dr, fix) {
+  const precise = S.profile.aiPrecise;
+  let s = `${METHOD}
+
+${dr.file ? 'Analiza la comida de la foto.' : `Analiza esta comida: "${dr.text}"`}${dr.context ? `\nContexto del usuario: "${dr.context}"` : ''}
+${precise ? `
+Modo preciso. Antes de responder, razona por dentro paso a paso:
+1. Localiza referencias de escala en la imagen (plato, cubiertos, vaso, mano, envases) y estima su tamaño real.
+2. Para cada alimento estima volumen → gramos con su densidad, mirando altura y superficie.
+3. Busca grasa oculta y salsas.
+4. Calcula nutrientes con tablas fiables y comprueba que las kcal cuadran con los macros.
+5. Si hay algo dudoso que cambie las kcal más de un 15 % (aceite, salsa, tamaño de ración, tipo de producto), formula hasta 2 preguntas cortas de sí/no. Si no hay dudas importantes, deja questions vacío.` : ''}
+Campos: grams (g), kcal, p = proteína g, c = carbohidratos g, f = grasa g, fib = fibra g, sug = azúcares g, na = sodio mg. Números sin unidades.
+Si no hay comida, devuelve items vacío y explícalo en notes.`;
+  if (fix) s += `\n\nTu estimación anterior:\n${JSON.stringify({ dish: dr.name, items: dr.items })}\nEl usuario aclara: "${fix}"\nRehaz la estimación teniendo en cuenta esto. No repitas preguntas ya contestadas.`;
+  return s + `\n\nResponde solo con JSON con esta forma:\n${AI_SCHEMA}`;
+}
+async function analyzeAI(fix) {
+  const dr = S.draft; if (!dr) return;
+  dr.status = 'loading'; dr.error = null; renderDraft();
+  dr.ctl?.abort(); const ctl = new AbortController(); dr.ctl = ctl;
+  try {
+    const parts = [{ text: aiPrompt(dr, fix) }];
+    if (dr.file) { dr.b64 ||= await blobToB64(await shrinkImage(dr.file, 1280)); parts.push({ inline_data: { mime_type: 'image/jpeg', data: dr.b64 } }); }
+    const res = await gemini(parts, { signal: ctl.signal });
+    if (S.draft !== dr) return;
+    const items = (Array.isArray(res?.items) ? res.items : []).map(it => ({ name: String(it.name || 'Alimento'), grams: R(num(it.grams)), kcal: R(num(it.kcal)), p: +num(it.p).toFixed(1), c: +num(it.c).toFixed(1), f: +num(it.f).toFixed(1), fib: +num(it.fib).toFixed(1), sug: +num(it.sug).toFixed(1), na: R(num(it.na)) }));
+    if (!items.length) { dr.status = 'error'; dr.error = res?.notes ? String(res.notes) : 'No veo comida. Prueba otra foto o descríbelo.'; renderDraft(); return; }
+    Object.assign(dr, { items, portion: 1, name: String(res.dish || items[0].name), status: 'ready', source: dr.file ? 'foto' : 'texto',
+      confidence: ['alta', 'media', 'baja'].includes(res.confidence) ? res.confidence : 'media', notes: res.notes ? String(res.notes) : '', tip: res.tip ? String(res.tip) : '',
+      questions: (Array.isArray(res.questions) ? res.questions : []).map(String).filter(Boolean).slice(0, 2), asked: [...(dr.asked || []), ...(fix ? [fix] : [])], ai: true });
+    if (dr.file) setPending(null);
+  } catch (e) {
+    if (S.draft !== dr) return;
+    dr.status = dr.items?.length ? 'ready' : 'error'; dr.error = e.code === 'cancelled' ? 'Cancelado.' : aiError(e);
+    if (dr.status === 'ready' && e.code !== 'cancelled') toast(dr.error);
+  }
+  renderDraft();
+}
+async function askAI(q) {
+  const out = $('#coachOut'), card = $('#coachCard');
+  S.coachText = 'Pensando…'; if (card) card.hidden = false; if (out) out.innerHTML = mdLite(S.coachText);
+  try {
+    S.coachText = await gemini([{ text: `Eres el coach de nutrición de Mordisco. Hablas en español de España, cercano y directo, como un buen entrenador personal.\n\n${contextBlock()}\n\nPregunta: ${q}\n\nMáximo 150 palabras, con viñetas "- " si hay lista. Si propones comida, da cantidades a ojo (sin báscula) con kcal y proteína aproximadas y productos de supermercado italiano.` }], { json: false, precise: false });
+  } catch (e) { S.coachText = aiError(e); }
+  if (S.tab === 'coach') { const o = $('#coachOut'); if (o) o.innerHTML = mdLite(S.coachText); }
+}
+async function planAI() {
+  S.draft = { status: 'plan-view' };
+  openSheet(`<h2>Preparando tu plan</h2><div class="loading"><div class="spin"></div><b>Gemini está montando 7 días de menú y la lista de la compra…</b><span class="note">Suele tardar 30-60 segundos.</span></div><button class="btn ghost" data-act="close">Cancelar</button>`);
+  try {
+    const res = await gemini([{ text: planPrompt(true) }], { precise: S.profile.aiPrecise });
+    const meals = (res.meals || []).map(m => ({ d: clamp(R(num(m.d, 1)), 1, 7), slot: normSlot(m.slot), name: String(m.name || 'Comida'), kcal: R(num(m.kcal)), p: R(num(m.p)), c: R(num(m.c)), f: R(num(m.f)), recipe: m.recipe ? String(m.recipe) : '', done: false }));
+    if (!meals.length) throw { code: 'empty' };
+    if (S.draft?.status !== 'plan-view') return;
+    importPlan({ meals, shop: (res.shop || []).map(String).filter(Boolean).map(t => ({ t, done: false })) });
+  } catch (e) {
+    if (S.draft?.status !== 'plan-view') return;
+    openSheet(`<h2>No se pudo hacer el plan</h2><div class="err">${esc(aiError(e))}</div><button class="btn solid" data-act="planGPT">Pedírselo a ChatGPT</button><button class="btn ghost" data-act="close">Cerrar</button>`);
+  }
+}
+function mdLite(t) {
+  if (!t) return '';
+  const lines = esc(t).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').split('\n');
+  let out = '', inList = false;
+  for (const l of lines) {
+    const m = l.match(/^\s*[-*•]\s+(.*)/);
+    if (m) { if (!inList) { out += '<ul>'; inList = true; } out += `<li>${m[1]}</li>`; continue; }
+    if (inList) { out += '</ul>'; inList = false; }
+    if (l.trim()) out += `<p>${l.replace(/^#+\s*/, '')}</p>`;
+  }
+  return out + (inList ? '</ul>' : '');
 }
 
 /* pending photo: survives the trip to ChatGPT and back */
@@ -405,7 +532,7 @@ function viewToday() {
   const wk = t.week ? (() => { const used = t.week.eaten + tot.kcal; return `<div class="weekline"><div class="row" style="justify-content:space-between"><span>Semana</span><b>${fmt(used)} / ${fmt(t.week.budget)} kcal</b></div><div class="track"><i style="width:${clamp(used / t.week.budget * 100, 0, 100)}%;background:var(--ink)"></i></div></div>`; })() : '';
 
   const pend = getPending();
-  const setup = !p.gptReady ? `<section class="card"><h2>Primer paso</h2><p class="tip">Crea tu GPT "Mordisco" en ChatGPT (2 minutos). Así le mandas la foto y con un toque entra aquí.</p><button class="btn solid" data-act="tab" data-tab="perfil">Configurar ChatGPT</button></section>` : '';
+  const setup = !hasAI() ? `<section class="card"><h2>Primer paso</h2><p class="tip">Activa la IA gratis de Gemini (2 minutos): haces la foto y las calorías salen aquí mismo.</p><button class="btn solid" data-act="tab" data-tab="perfil">Activar IA</button></section>` : '';
   const waiting = pend ? `<section class="card"><h2>Esperando a ChatGPT</h2><div class="row" style="flex-wrap:nowrap">${pend.thumb ? `<img class="thumb" src="${pend.thumb}" alt="">` : ''}<p class="tip" style="flex:1">Cuando ChatGPT responda, toca <strong>Añadir a Mordisco</strong> en su mensaje, o pega aquí su respuesta.</p></div><div class="row"><button class="btn sm solid" data-act="paste">Pegar respuesta</button><button class="btn sm soft" data-act="resend">Enviar otra vez</button><button class="btn sm ghost" data-act="droppending">Descartar</button></div></section>` : '';
   const planned = planMealsFor(d.date);
   const planCard = planned.length ? `<section class="card"><h2>Plan de hoy <b>${fmt(planned.reduce((a, m) => a + m.kcal, 0))} kcal</b></h2>
@@ -669,19 +796,23 @@ function viewCoach() {
       <div class="checks">${pl.shop.map((s, i) => `<label class="check ${s.done ? 'done' : ''}"><input type="checkbox" data-shop="${i}" ${s.done ? 'checked' : ''}><span>${esc(s.t)}</span></label>`).join('')}</div>` : ''}
     </section>`;
   })() : `<section class="card"><h2>Plan semanal y compra</h2>
-      <p class="tip">ChatGPT te hace un menú de 7 días con tus calorías y proteína, recetas de 20 minutos, tu día de comer fuera${S.profile.fasting.on ? ', tu ventana de ayuno' : ''} y la lista de la compra para el súper. Lo cargas con un toque y cada comida se apunta con otro.</p>
-      <button class="btn solid block" data-act="newplan">Pedir plan a ChatGPT</button>
+      <p class="tip">${hasAI() ? 'Gemini' : 'ChatGPT'} te hace un menú de 7 días con tus calorías y proteína, recetas de 20 minutos, tu día de comer fuera${S.profile.fasting.on ? ', tu ventana de ayuno' : ''} y la lista de la compra para el súper. Cada comida se apunta con un toque.</p>
+      <button class="btn solid block" data-act="newplan">Hacer mi plan</button>
+      ${hasAI() ? '<button class="btn sm ghost" data-act="planGPT">Pedírselo a ChatGPT</button>' : ''}
       <button class="btn sm ghost" data-act="paste">Pegar plan de ChatGPT</button></section>`;
+  const ai = hasAI();
   return `
   <section class="card"><h2>Tu día</h2>${coachTips()}</section>
   ${planCard}
   ${weekReport()}
   <section class="card">
-    <h2>Pregunta a ChatGPT</h2>
-    <p class="tip">Le mando tus números de hoy y de la semana junto a tu pregunta, para que te conteste con datos reales.</p>
+    <h2>Pregúntame</h2>
+    <p class="tip">Le paso tus números de hoy y de la semana a ${ai ? 'Gemini' : 'ChatGPT'} junto a tu pregunta, para que te conteste con datos reales.</p>
     <div class="field"><label for="qIn">Tu pregunta</label><textarea id="qIn" placeholder="¿Qué ceno con lo que me queda? ¿Qué pido en el McDonald's?"></textarea></div>
-    <button class="btn solid block" data-act="ask">Preguntar a ChatGPT</button>
-  </section>`;
+    <button class="btn solid block" data-act="ask">Preguntar</button>
+    ${ai ? '<button class="btn sm ghost" data-act="askGPT">Preguntar a ChatGPT</button>' : ''}
+  </section>
+  <section class="card" id="coachCard" ${S.coachText ? '' : 'hidden'}><h2>Respuesta</h2><div class="coach" id="coachOut">${mdLite(S.coachText)}</div></section>`;
 }
 function viewPlanSheet() {
   const pl = S.profile.plan; if (!pl) return;
@@ -691,7 +822,7 @@ function viewPlanSheet() {
     const ms = pl.meals.map((m, i) => ({ ...m, i })).filter(m => m.d === d); if (!ms.length) continue;
     const date = addDays(pl.week, d - 1);
     html += `<div class="slot"><div class="slot-h"><h3 style="text-transform:capitalize">${DAYS[d - 1]} ${new Date(date + 'T12:00:00').getDate()}</h3><span>${fmt(ms.reduce((a, m) => a + m.kcal, 0))} kcal</span></div>
-      ${ms.map(m => `<div class="planrow ${m.done ? 'done' : ''}"><div><div class="nm">${esc(m.name)}</div><div class="sub">${slotName(m.slot)} · ${fmt(m.kcal)} kcal · P ${m.p} · C ${m.c} · G ${m.f}</div></div></div>`).join('')}</div>`;
+      ${ms.map(m => `<div class="planrow ${m.done ? 'done' : ''}"><div><div class="nm">${esc(m.name)}</div><div class="sub">${slotName(m.slot)} · ${fmt(m.kcal)} kcal · P ${m.p} · C ${m.c} · G ${m.f}</div>${m.recipe ? `<div class="recipe">${esc(m.recipe)}</div>` : ''}</div></div>`).join('')}</div>`;
   }
   openSheet(html + '<button class="btn ghost" data-act="close">Cerrar</button>');
 }
@@ -702,7 +833,20 @@ function viewProfile() {
   const sel = (id, opts, v) => `<select id="${id}">${opts.map(([val, l]) => `<option value="${val}" ${String(val) === String(v) ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
   return `
   <section class="card">
-    <h2>Conectar con ChatGPT</h2>
+    <h2>IA de las fotos <b>${hasAI() ? 'Gemini activo' : 'sin activar'}</b></h2>
+    <p class="tip">Con Gemini haces la foto y el resultado sale aquí mismo, gratis. Para activarlo:</p>
+    <ol class="steps">
+      <li>Entra en <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> con tu cuenta de Google.</li>
+      <li>Toca <strong>Create API key</strong> (Crear clave) y cópiala.</li>
+      <li>Pégala aquí y guarda. Se queda solo en este móvil.</li>
+    </ol>
+    <div class="field"><label for="pGem">Clave de Gemini</label><input id="pGem" type="password" autocomplete="off" value="${esc(p.geminiKey)}" placeholder="AIza…"></div>
+    <div class="field"><label for="pMode">Modo</label><select id="pMode"><option value="1" ${p.aiPrecise ? 'selected' : ''}>Preciso: el mejor modelo disponible, piensa más y te pregunta dudas</option><option value="0" ${p.aiPrecise ? '' : 'selected'}>Rápido: respuesta en pocos segundos</option></select></div>
+    <div class="row"><button class="btn solid" data-act="savegem">Guardar</button>${hasAI() ? '<button class="btn soft" data-act="testgem">Probar</button>' : ''}</div>
+    <p class="note" id="gemStatus">${S.lastModel ? 'Último modelo usado: ' + esc(S.lastModel) + '.' : ''} En la versión gratis Google puede usar lo que envías para mejorar sus modelos. ChatGPT sigue disponible como respaldo.</p>
+  </section>
+  <section class="card">
+    <h2>ChatGPT (respaldo)</h2>
     <ol class="steps">
       <li>En ChatGPT (mejor desde el ordenador): <strong>Explorar GPT → Crear</strong> → pestaña <strong>Configurar</strong>.</li>
       <li>Nombre: <strong>Mordisco</strong>. En <strong>Instrucciones</strong> pega lo que copia este botón:</li>
@@ -777,10 +921,11 @@ function openAdd(slot) {
 async function onPhoto(file) {
   if (!file) return;
   const slot = S.slotFor || autoSlot();
-  const dr = { slot, file, url: URL.createObjectURL(file), thumb: null, status: 'photo' };
+  const dr = { slot, file, url: URL.createObjectURL(file), thumb: null, status: hasAI() ? 'loading' : 'photo' };
   S.draft = dr; renderDraft();
   dr.thumb = await makeThumb(file);
   setPending({ at: Date.now(), slot, thumb: dr.thumb, date: S.date });
+  if (hasAI() && S.draft === dr) analyzeAI();
 }
 async function makeThumb(file) {
   try {
@@ -799,18 +944,24 @@ function renderDraft() {
   const img = dr.url ? `<img class="photo" src="${dr.url}" alt="Tu comida">` : '';
   const slotSel = `<select id="dSlot">${SLOTS.map(([k, n]) => `<option value="${k}" ${k === dr.slot ? 'selected' : ''}>${n}</option>`).join('')}</select>`;
   let body = '';
-  if (dr.status === 'photo') {
+  if (dr.status === 'loading') {
+    body = `${img}<div class="loading"><div class="spin"></div><b id="loadMsg">${LOAD_MSGS[0]}</b><span class="note">${S.profile.aiPrecise ? 'Modo preciso: suele tardar 10-30 segundos.' : 'Unos segundos…'}</span><button class="btn sm ghost" data-act="stopai">Cancelar</button></div>`;
+    let i = 0; clearInterval(renderDraft.iv);
+    renderDraft.iv = setInterval(() => { const el = $('#loadMsg'); if (!el || S.draft?.status !== 'loading') return clearInterval(renderDraft.iv); el.textContent = LOAD_MSGS[++i % LOAD_MSGS.length]; }, 3500);
+  } else if (dr.status === 'error') {
+    body = `${img}<div class="err">${esc(dr.error)}</div>
+      <div class="row">${hasAI() && (dr.file || dr.text) ? '<button class="btn solid" data-act="retry">Reintentar</button>' : ''}${dr.file ? '<button class="btn soft" data-act="tochatgpt">Usar ChatGPT</button>' : ''}<button class="btn soft" data-act="manual">A mano</button></div>
+      <button class="btn ghost" data-act="close">Cerrar</button>`;
+  } else if (dr.status === 'photo') {
     body = `${img}
       <div class="field"><label for="dCtx">Contexto opcional</label><input id="dCtx" type="text" placeholder="con aceite, media ración, pasta 100 g en seco…"></div>
-      <button class="btn solid block" data-act="sharephoto">Enviar a ChatGPT</button>
-      <p class="note">Elige ChatGPT en la lista. Las instrucciones van con la foto y además quedan copiadas por si hace falta pegarlas.</p>
+      ${hasAI() ? '<button class="btn solid block" data-act="runphoto">Analizar aquí con Gemini</button><button class="btn soft block" data-act="sharephoto">Enviar a ChatGPT</button>' : '<button class="btn solid block" data-act="sharephoto">Enviar a ChatGPT</button><p class="note">Activa Gemini en Perfil para que la foto se analice aquí mismo, gratis.</p>'}
       ${pasteBox}
       <div class="row"><button class="btn ghost" data-act="manual">Añadir a mano</button><button class="btn ghost" data-act="close">Cerrar</button></div>`;
   } else if (dr.status === 'describe') {
     body = `<h2>Describe lo que comes</h2>
       <div class="field"><label for="dText">Cuanto más concreto, mejor</label><textarea id="dText" placeholder="Un plato hondo de pasta al ragù con parmesano y una ensalada con aceite. O: McMenu Big Mac mediano con Coca Zero">${esc(dr.text || '')}</textarea></div>
-      <button class="btn solid block" data-act="sharetext">Enviar a ChatGPT</button>
-      ${pasteBox}
+      ${hasAI() ? '<button class="btn solid block" data-act="runtext">Calcular</button><button class="btn sm ghost" data-act="sharetext">Enviar a ChatGPT</button>' : `<button class="btn solid block" data-act="sharetext">Enviar a ChatGPT</button>${pasteBox}`}
       <button class="btn ghost" data-act="close">Cancelar</button>`;
   } else if (dr.status === 'paste') {
     body = `<h2>Pegar de ChatGPT</h2>${pasteBox}<button class="btn ghost" data-act="close">Cancelar</button>`;
@@ -828,7 +979,10 @@ function renderDraft() {
         <div class="nums">${[['grams', 'g'], ['kcal', 'kcal'], ['p', 'Prot'], ['c', 'Carb'], ['f', 'Grasa']].map(([f, l]) => `<div class="field"><label for="i${i}${f}">${l}</label><input id="i${i}${f}" type="number" inputmode="decimal" data-f="${f}" data-i="${i}" value="${it[f] ? R(it[f] * 10) / 10 : ''}"></div>`).join('')}</div>
       </div>`).join('')}</div>
       <button class="addline" data-act="additem">+ Añadir alimento</button>
-      <p class="note">Si cambias los gramos, recalculo el resto en proporción. Para corregir con IA, díselo a ChatGPT en la misma conversación y toca su nuevo enlace.</p>
+      ${dr.questions?.length ? `<div class="qa"><b>Para afinar:</b>${dr.questions.map((q, i) => `<div class="qrow"><span>${esc(q)}</span><span class="row"><button class="chip" data-act="aians" data-i="${i}" data-a="Sí">Sí</button><button class="chip" data-act="aians" data-i="${i}" data-a="No">No</button></span></div>`).join('')}</div>` : ''}
+      ${dr.tip ? `<p class="tip"><strong>Consejo:</strong> ${esc(dr.tip)}</p>` : ''}
+      ${dr.ai && hasAI() ? `<div class="field"><label for="dFix">¿Algo no cuadra? Díselo</label><textarea id="dFix" placeholder="Sin aceite. La pasta era la mitad. Era pollo, no cerdo."></textarea></div><button class="btn soft" data-act="aifix">Corregir</button>` : ''}
+      <p class="note">Si cambias los gramos, recalculo el resto en proporción.${dr.ai ? '' : ' Para corregir con IA, díselo a ChatGPT en la misma conversación y toca su nuevo enlace.'}</p>
       <div class="field"><label for="dSlot">Momento</label>${slotSel}</div>
       <button class="btn solid block" data-act="savemeal">${dr.editId ? 'Guardar cambios' : 'Añadir al diario'}</button>
       ${dr.editId ? `<button class="btn danger" data-act="delmeal">${dr.confirmDel ? 'Toca otra vez para borrar' : 'Borrar comida'}</button>` : `<button class="btn ghost" data-act="discard">Descartar</button>`}`;
@@ -852,6 +1006,7 @@ function saveMeal() {
 }
 function exportData() {
   const data = {}; for (const k of Store.keys()) data[k] = Store.get(k);
+  if (data.profile) data.profile = { ...data.profile, geminiKey: '' };   // never put the key in a file
   const blob = new Blob([JSON.stringify({ app: 'mordisco', v: 1, at: new Date().toISOString(), data })], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `mordisco-${todayISO()}.json`; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
@@ -884,8 +1039,26 @@ document.addEventListener('click', e => {
     case 'undo': { const fn = S.undo; S.undo = null; $('#toast').hidden = true; fn?.(); break; }
     case 'quick': { const r = p.recent[+a.dataset.i]; if (!r) return; addMeal({ id: uid(), slot: a.dataset.slot, time: new Date().toISOString(), name: r.name, thumb: r.thumb, items: structuredClone(r.items), source: r.source }); break; }
     case 'repeat': { const r = p.recent[+a.dataset.i]; S.draft = { slot: S.slotFor || autoSlot(), name: r.name, thumb: r.thumb, items: structuredClone(r.items), status: 'ready', source: r.source, portion: 1 }; renderDraft(); break; }
-    case 'sharephoto': sendToGPT(photoPrompt($('#dCtx').value.trim()), dr.file); break;
+    case 'sharephoto': sendToGPT(photoPrompt($('#dCtx')?.value.trim() || ''), dr.file); break;
     case 'sharetext': { const t = $('#dText').value.trim(); if (!t) { toast('Escribe qué has comido.'); return; } dr.text = t; setPending(null); sendToGPT(textPrompt(t)); break; }
+    case 'runphoto': dr.context = $('#dCtx')?.value.trim() || ''; analyzeAI(); break;
+    case 'runtext': { const t = $('#dText').value.trim(); if (!t) { toast('Escribe qué has comido.'); return; } dr.text = t; setPending(null); analyzeAI(); break; }
+    case 'retry': analyzeAI(); break;
+    case 'stopai': dr?.ctl?.abort(); break;
+    case 'tochatgpt': dr.status = 'photo'; renderDraft(); break;
+    case 'aians': { const q = dr.questions[+a.dataset.i]; analyzeAI(`${q} → ${a.dataset.a}`); break; }
+    case 'aifix': { const f = $('#dFix').value.trim(); if (!f) { toast('Escribe qué hay que corregir.'); return; } analyzeAI(f); break; }
+    case 'savegem': {
+      p.geminiKey = $('#pGem').value.trim(); p.aiPrecise = $('#pMode').value === '1';
+      saveProfile(); render(); toast(p.geminiKey ? 'Gemini guardado. Toca Probar.' : 'Gemini desactivado'); break;
+    }
+    case 'testgem': {
+      const st = $('#gemStatus'); if (st) st.textContent = 'Probando…';
+      gemini([{ text: 'Responde solo con JSON {"ok":true,"kcal":N} donde N son las kcal de una manzana mediana.' }], { precise: false })
+        .then(r => { const s = $('#gemStatus'); if (s) s.textContent = `Funciona (${S.lastModel}). Una manzana ≈ ${R(num(r.kcal))} kcal.`; toast('Gemini funciona'); })
+        .catch(e => { const s = $('#gemStatus'); if (s) s.textContent = aiError(e); });
+      break;
+    }
     case 'readpaste': receiveAny($('#dPaste').value); break;
     case 'resend': { const pe = getPending(); S.slotFor = pe?.slot; $('#galIn').click(); toast('Elige la foto otra vez'); break; }
     case 'droppending': setPending(null); render(); break;
@@ -905,7 +1078,8 @@ document.addEventListener('click', e => {
       break;
     }
     case 'viewplan': viewPlanSheet(); break;
-    case 'newplan': sendToGPT(planPrompt()); break;
+    case 'newplan': if (hasAI()) planAI(); else sendToGPT(planPrompt()); break;
+    case 'planGPT': closeSheet(); sendToGPT(planPrompt()); break;
     case 'faststart': startFast(a.dataset.from ? +a.dataset.from : null); toast('Ayuno empezado'); break;
     case 'fastend': { const h = endFast(); render(); toast(`Ayuno de ${hm(h)}`); break; }
     case 'bodyphoto': $('#bodyIn').click(); break;
@@ -933,7 +1107,8 @@ document.addEventListener('click', e => {
       if (u && !/^https:\/\/(chatgpt\.com|chat\.openai\.com)\//.test(u)) { toast('Pega el enlace de tu GPT (chatgpt.com/g/…).'); return; }
       p.gptUrl = u; p.gptReady = true; saveProfile(); render(); toast('Listo'); break;
     }
-    case 'ask': { const q = $('#qIn').value.trim(); if (!q) { toast('Escribe tu pregunta.'); return; } sendToGPT(`${contextBlock()}\n\nPregunta: ${q}\n\nContesta en español de España, corto y concreto (máximo 150 palabras), como un buen entrenador personal. Si propones comida, da cantidades a ojo (sin báscula) con kcal y proteína, y productos de supermercado italiano.`); break; }
+    case 'ask': if (hasAI()) { const q = $('#qIn').value.trim(); if (!q) { toast('Escribe tu pregunta.'); return; } askAI(q); break; } // falls through to ChatGPT
+    case 'askGPT': { const q = $('#qIn').value.trim(); if (!q) { toast('Escribe tu pregunta.'); return; } sendToGPT(`${contextBlock()}\n\nPregunta: ${q}\n\nContesta en español de España, corto y concreto (máximo 150 palabras), como un buen entrenador personal. Si propones comida, da cantidades a ojo (sin báscula) con kcal y proteína, y productos de supermercado italiano.`); break; }
     case 'export': exportData(); break;
     case 'import': $('#impIn').click(); break;
   }

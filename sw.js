@@ -1,5 +1,5 @@
 // Offline support: always try the network first so updates arrive at once; fall back to the cache without connection.
-const CACHE = 'mordisco-v4';
+const CACHE = 'mordisco-v5';
 const SHELL = ['./', 'index.html', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
