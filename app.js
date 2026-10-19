@@ -164,12 +164,12 @@ function loadState() {
 }
 function loadDay(date) { S.date = date; S.day = Object.assign(emptyDay(date), Store.get('day-' + date) || {}); render(); }
 function addMeal(meal, msg) {
-  const before = JSON.stringify(S.day.meals);
+  const before = JSON.stringify(S.day.meals), fastBefore = S.profile.fastStart, fastsBefore = S.profile.fasts;
   S.day.meals.push(meal); bumpRecent(meal);
   const endedFast = maybeEndFast(meal);
   saveDay(); render(); buzz();
   toast(msg || `Añadido · ${fmt(mealKcal(meal))} kcal · ${R(mealP(meal))} g proteína${endedFast ? ' · ayuno terminado' : ''}`,
-    () => { S.day.meals = JSON.parse(before); saveDay(); render(); });
+    () => { S.day.meals = JSON.parse(before); S.profile.fastStart = fastBefore; S.profile.fasts = fastsBefore; saveDay(); render(); });
 }
 function bumpRecent(meal) {
   const rec = S.profile.recent || [];
@@ -633,7 +633,7 @@ function coachTips() {
   if (d.steps < 7000 && hour < 21) tips.push(`Un paseo de 30 minutos son unos 3.500 pasos y te sube el objetivo de hoy unas 100 kcal.`);
   const st = streak();
   if (st >= 3) tips.push(`Llevas <strong>${st} días seguidos</strong> apuntando. Eso es lo que más predice que bajes de peso.`);
-  return tips.map(t => `<p class="tip">${t}</p>`).join('');
+  return tips.map(t => `<div class="tip">${t}</div>`).join('');
 }
 function weekReport() {
   const p = S.profile, ws = weekStart(todayISO()), prev = addDays(ws, -7);
