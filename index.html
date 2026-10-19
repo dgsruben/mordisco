@@ -171,6 +171,29 @@ textarea{resize:vertical;min-height:64px}
 .kv{display:flex;justify-content:space-between;gap:8px;font-size:14px;font-variant-numeric:tabular-nums;border-bottom:1px solid var(--line);padding-block:7px}
 .kv:last-child{border-bottom:0}
 .kv span{color:var(--muted)}
+#toast{display:flex;align-items:center;gap:12px}
+.tbtn{border:0;background:transparent;color:var(--accent);font-weight:700;padding:2px 0;text-decoration:underline;text-underline-offset:3px}
+.quick{display:flex;gap:6px;flex-wrap:wrap}
+.qk{background:var(--accent-soft);border-color:transparent;color:var(--ink);font-weight:600;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.weekline{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted)}
+.weekline b{color:var(--ink);font-variant-numeric:tabular-nums}
+.weekline .track{height:5px}
+.planrow{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border-radius:14px;background:var(--bg)}
+.planrow>div{min-width:0}
+.planrow .nm{font-weight:600;font-size:14px}
+.planrow .sub{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.planrow.done{opacity:.55}
+.photos{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.ph{border:0;padding:0;background:transparent;display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted);font-weight:600}
+.ph img{width:100%;aspect-ratio:3/4;object-fit:cover;border-radius:12px;background:var(--surface-2)}
+.cmp{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.cmp figure{margin:0;display:flex;flex-direction:column;gap:4px}
+.cmp img{width:100%;aspect-ratio:3/4;object-fit:cover;border-radius:12px}
+.cmp figcaption{font-size:12.5px;color:var(--muted);font-weight:600;text-align:center}
+.checks{display:flex;flex-direction:column;gap:2px}
+.check{display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid var(--line);font-size:14.5px}
+.check input{width:20px;height:20px;accent-color:var(--accent);flex:none}
+.check.done span{text-decoration:line-through;color:var(--muted)}
 .steps{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px;font-size:14px}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 </style>
@@ -197,6 +220,7 @@ textarea{resize:vertical;min-height:64px}
 
 <input type="file" id="camIn" accept="image/*" capture="environment" hidden>
 <input type="file" id="galIn" accept="image/*" hidden>
+<input type="file" id="bodyIn" accept="image/*" hidden>
 <div id="sheetWrap" hidden><div class="backdrop" data-act="close"></div><div class="sheet" id="sheet" role="dialog" aria-modal="true"></div></div>
 <div id="toast" hidden></div>
 
