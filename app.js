@@ -175,7 +175,7 @@ function addMeal(meal, msg) {
 function bumpRecent(meal) {
   const rec = S.profile.recent || [];
   const old = rec.find(r => r.name.toLowerCase() === meal.name.toLowerCase());
-  const entry = { name: meal.name, thumb: meal.thumb, items: meal.items, source: meal.source, slot: meal.slot, n: (old?.n || 0) + 1, last: Date.now() };
+  const entry = { name: meal.name, thumb: meal.thumb, items: meal.items, source: meal.source, slot: meal.slot, n: (old?.n || 0) + 1, last: Date.now(), fp: meal.fp || old?.fp || null };
   S.profile.recent = [entry, ...rec.filter(r => r !== old)].slice(0, 30);
 }
 
@@ -372,7 +372,7 @@ function aiError(e) {
 }
 const LOAD_MSGS = ['Reconociendo alimentos…', 'Midiendo raciones por el tamaño del plato…', 'Buscando el aceite escondido…', 'Cuadrando calorías y macros…'];
 const blobToB64 =blob => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(blob); });
-const AI_SCHEMA = `{"dish":"nombre corto del plato","confidence":"alta|media|baja","items":[{"name":"alimento y cómo está cocinado","grams":0,"kcal":0,"p":0,"c":0,"f":0,"fib":0,"sug":0,"na":0}],"notes":"qué has supuesto, en una frase","questions":["hasta 2 preguntas de sí/no cuya respuesta cambiaría las kcal más de un 15 %"],"tip":"un consejo breve para perder grasa sobre este plato"}`;
+const AI_SCHEMA = `{"dish":"nombre corto del plato","same_as":"nombre exacto de un plato habitual o cadena vacía","confidence":"alta|media|baja","items":[{"name":"alimento y cómo está cocinado","grams":0,"kcal":0,"p":0,"c":0,"f":0,"fib":0,"sug":0,"na":0}],"notes":"qué has supuesto, en una frase","questions":["hasta 2 preguntas de sí/no cuya respuesta cambiaría las kcal más de un 15 %"],"tip":"un consejo breve para perder grasa sobre este plato"}`;
 function aiPrompt(dr, fix) {
   const precise = S.profile.aiPrecise;
   let s = `${METHOD}
@@ -387,6 +387,8 @@ Modo preciso. Antes de responder, razona por dentro paso a paso:
 5. Si hay algo dudoso que cambie las kcal más de un 15 % (aceite, salsa, tamaño de ración, tipo de producto), formula hasta 2 preguntas cortas de sí/no. Si no hay dudas importantes, deja questions vacío.` : ''}
 Campos: grams (g), kcal, p = proteína g, c = carbohidratos g, f = grasa g, fib = fibra g, sug = azúcares g, na = sodio mg. Números sin unidades.
 Si no hay comida, devuelve items vacío y explícalo en notes.`;
+  const usual = (S.profile.recent || []).slice(0, 20).map(r => `- ${r.name} · ${R(mealKcal(r))} kcal`).join('\n');
+  if (usual && !fix) s += `\n\nPlatos habituales del usuario (nombre · kcal):\n${usual}\nSi la comida parece claramente uno de estos (aunque la foto o la descripción no sean idénticas: mismo plato, mismos ingredientes, ración parecida), pon su nombre exacto en "same_as". Si no, deja "same_as" vacío. Analiza igualmente la comida.`;
   if (fix) s += `\n\nTu estimación anterior:\n${JSON.stringify({ dish: dr.name, items: dr.items })}\nEl usuario aclara: "${fix}"\nRehaz la estimación teniendo en cuenta esto. No repitas preguntas ya contestadas.`;
   return s + `\n\nResponde solo con JSON con esta forma:\n${AI_SCHEMA}`;
 }
@@ -404,6 +406,7 @@ async function analyzeAI(fix) {
     Object.assign(dr, { items, portion: 1, name: String(res.dish || items[0].name), status: 'ready', source: dr.file ? 'foto' : 'texto',
       confidence: ['alta', 'media', 'baja'].includes(res.confidence) ? res.confidence : 'media', notes: res.notes ? String(res.notes) : '', tip: res.tip ? String(res.tip) : '',
       questions: (Array.isArray(res.questions) ? res.questions : []).map(String).filter(Boolean).slice(0, 2), asked: [...(dr.asked || []), ...(fix ? [fix] : [])], ai: true });
+    if (!fix && res.same_as && !dr.declined) { const i = S.profile.recent.findIndex(r => r.name.toLowerCase() === String(res.same_as).toLowerCase().trim()); if (i >= 0) dr.sameAs = i; }
     if (dr.file) setPending(null);
   } catch (e) {
     if (S.draft !== dr) return;
@@ -948,11 +951,39 @@ function openAdd(slot) {
 async function onPhoto(file) {
   if (!file) return;
   const slot = S.slotFor || autoSlot();
-  const dr = { slot, file, url: URL.createObjectURL(file), thumb: null, status: hasAI() ? 'loading' : 'photo' };
+  const dr = { slot, file, url: URL.createObjectURL(file), thumb: null, status: hasAI() ? 'context' : 'photo', chips: [] };
   S.draft = dr; renderDraft();
-  dr.thumb = await makeThumb(file);
+  [dr.thumb, dr.fp] = await Promise.all([makeThumb(file), fingerprint(file)]);
   setPending({ at: Date.now(), slot, thumb: dr.thumb, date: S.date });
-  if (hasAI() && S.draft === dr) analyzeAI();
+  // looks like a dish you already logged? ask before spending an AI call
+  if (dr.fp) {
+    const best = (S.profile.recent || []).map((r, i) => ({ i, d: r.fp ? fpDist(dr.fp, r.fp) : 99 })).sort((a, b) => a.d - b.d)[0];
+    if (best && best.d <= 14) dr.sameAs = best.i;
+  }
+  if (S.draft === dr) renderDraft();
+}
+// tiny perceptual fingerprint of a photo (difference hash + average colour) to spot repeated dishes
+async function fingerprint(file) {
+  try {
+    const bmp = await createImageBitmap(file), c = document.createElement('canvas'); c.width = 9; c.height = 8;
+    const x = c.getContext('2d'); x.drawImage(bmp, 0, 0, 9, 8);
+    const d = x.getImageData(0, 0, 9, 8).data, lum = p => d[p] * 0.3 + d[p + 1] * 0.59 + d[p + 2] * 0.11;
+    let h = '', r = 0, g = 0, b = 0;
+    for (let y = 0; y < 8; y++) for (let i = 0; i < 8; i++) { const p = (y * 9 + i) * 4; h += lum(p) > lum(p + 4) ? '1' : '0'; }
+    for (let k = 0; k < d.length; k += 4) { r += d[k]; g += d[k + 1]; b += d[k + 2]; }
+    const n = d.length / 4;
+    return { h, c: [R(r / n), R(g / n), R(b / n)] };
+  } catch { return null; }
+}
+function fpDist(a, b) {
+  let h = 0; for (let i = 0; i < 64; i++) if (a.h[i] !== b.h[i]) h++;
+  return h + Math.hypot(a.c[0] - b.c[0], a.c[1] - b.c[1], a.c[2] - b.c[2]) / 8;
+}
+const CTX_CHIPS = ['Con aceite', 'Sin aceite', 'Ración pequeña', 'Ración grande', 'Es una bebida', 'Lleva leche', 'Lleva salsa'];
+function useSaved(i) {
+  const dr = S.draft, r = S.profile.recent[i]; if (!r) return;
+  Object.assign(dr, { name: r.name, items: structuredClone(r.items), status: 'ready', portion: 1, confidence: null, notes: 'Mismos valores que la última vez.', questions: [], sameAs: null, ai: false, source: r.source || 'foto' });
+  setPending(null); renderDraft();
 }
 async function makeThumb(file) {
   try {
@@ -971,7 +1002,16 @@ function renderDraft() {
   const img = dr.url ? `<img class="photo" src="${dr.url}" alt="Tu comida">` : '';
   const slotSel = `<select id="dSlot">${SLOTS.map(([k, n]) => `<option value="${k}" ${k === dr.slot ? 'selected' : ''}>${n}</option>`).join('')}</select>`;
   let body = '';
-  if (dr.status === 'loading') {
+  const same = dr.sameAs != null && S.profile.recent[dr.sameAs];
+  const sameBox = same ? `<div class="qa"><div class="row" style="flex-wrap:nowrap">${thumbOf(same)}<span style="flex:1;min-width:0">¿Es lo mismo que <strong>${esc(same.name)}</strong> (${fmt(mealKcal(same))} kcal${same.n > 1 ? `, ${same.n} veces` : ''})?</span></div>
+    <div class="row"><button class="btn sm solid" data-act="same">Sí, lo mismo</button><button class="btn sm soft" data-act="notsame">No, es distinto</button></div></div>` : '';
+  if (dr.status === 'context') {
+    body = `${img}${sameBox}
+      <div class="field"><label>Afina (opcional)</label><div class="row">${CTX_CHIPS.map(c => `<button class="chip ${dr.chips.includes(c) ? 'on' : ''}" data-act="ctxchip" data-c="${c}">${c}</button>`).join('')}</div></div>
+      <div class="field"><label for="dCtx">¿Qué lleva? (opcional)</label><input id="dCtx" type="text" value="${esc(dr.context || '')}" placeholder="2 scoops de whey y 300 ml de leche semi, pasta 100 g en seco…"></div>
+      <button class="btn ${same ? 'soft' : 'solid'} block" data-act="runphoto">Analizar</button>
+      <div class="row"><button class="btn sm ghost" data-act="tochatgpt">Usar ChatGPT</button><button class="btn sm ghost" data-act="close">Cancelar</button></div>`;
+  } else if (dr.status === 'loading') {
     body = `${img}<div class="loading"><div class="spin"></div><b id="loadMsg">${LOAD_MSGS[0]}</b><span class="note">${S.profile.aiPrecise ? 'Modo preciso: suele tardar 10-30 segundos.' : 'Unos segundos…'}</span><button class="btn sm ghost" data-act="stopai">Cancelar</button></div>`;
     let i = 0; clearInterval(renderDraft.iv);
     renderDraft.iv = setInterval(() => { const el = $('#loadMsg'); if (!el || S.draft?.status !== 'loading') return clearInterval(renderDraft.iv); el.textContent = LOAD_MSGS[++i % LOAD_MSGS.length]; }, 3500);
@@ -997,6 +1037,7 @@ function renderDraft() {
     const sum = dr.items.reduce((a, it) => { for (const f of ['kcal', 'p', 'c', 'f']) a[f] += num(it[f]) * k; return a; }, { kcal: 0, p: 0, c: 0, f: 0 });
     const portions = [[0.5, '½'], [0.75, '¾'], [1, '1×'], [1.25, '1¼'], [1.5, '1½'], [2, '2×']].map(([v, l]) => `<button class="chip ${v === k ? 'on' : ''}" data-act="portion" data-v="${v}">${l}</button>`).join('');
     body = `${dr.thumb ? `<img class="thumb" src="${dr.thumb}" alt="" style="width:72px;height:72px">` : ''}
+      ${sameBox}
       <div class="field"><label for="dName">Plato</label><input id="dName" type="text" value="${esc(dr.name)}" placeholder="Nombre del plato"></div>
       ${dr.confidence ? `<div class="row"><span class="badge ${dr.confidence}">Confianza ${dr.confidence}</span>${dr.notes ? `<span class="note" style="flex:1;min-width:0">${esc(dr.notes)}</span>` : ''}</div>` : ''}
       <div class="sum"><div><b>${fmt(sum.kcal)}</b><span>kcal</span></div><div><b style="color:var(--prot)">${R(sum.p)}</b><span>proteína g</span></div><div><b style="color:var(--carb)">${R(sum.c)}</b><span>carbos g</span></div><div><b style="color:var(--fat)">${R(sum.f)}</b><span>grasa g</span></div></div>
@@ -1021,7 +1062,7 @@ function saveMeal() {
   const items = dr.items.filter(it => it.name.trim() || num(it.kcal)).map(it => {
     const o = { ...it }; for (const f of ['grams', 'kcal', 'p', 'c', 'f', 'fib', 'sug', 'na']) o[f] = +(num(it[f]) * k).toFixed(1); return o; });
   if (!items.length) { toast('Añade al menos un alimento con calorías.'); return; }
-  const meal = { id: dr.editId || uid(), slot: dr.slot, time: dr.time || new Date().toISOString(), name: (dr.name || items[0].name).trim() || 'Comida', thumb: dr.thumb || null, items, confidence: dr.confidence || null, notes: dr.notes || '', source: dr.source };
+  const meal = { id: dr.editId || uid(), slot: dr.slot, time: dr.time || new Date().toISOString(), name: (dr.name || items[0].name).trim() || 'Comida', thumb: dr.thumb || null, items, confidence: dr.confidence || null, notes: dr.notes || '', source: dr.source, fp: dr.fp || null };
   const editing = !!dr.editId;
   if (!editing) setPending(null);
   closeSheet();
@@ -1068,7 +1109,10 @@ document.addEventListener('click', e => {
     case 'repeat': { const r = p.recent[+a.dataset.i]; S.draft = { slot: S.slotFor || autoSlot(), name: r.name, thumb: r.thumb, items: structuredClone(r.items), status: 'ready', source: r.source, portion: 1 }; renderDraft(); break; }
     case 'sharephoto': sendToGPT(photoPrompt($('#dCtx')?.value.trim() || ''), dr.file); break;
     case 'sharetext': { const t = $('#dText').value.trim(); if (!t) { toast('Escribe qué has comido.'); return; } dr.text = t; setPending(null); sendToGPT(textPrompt(t)); break; }
-    case 'runphoto': dr.context = $('#dCtx')?.value.trim() || ''; analyzeAI(); break;
+    case 'runphoto': dr.context = [...(dr.chips || []), $('#dCtx')?.value.trim()].filter(Boolean).join(', '); analyzeAI(); break;
+    case 'ctxchip': { dr.context = $('#dCtx')?.value.trim() || ''; const c = a.dataset.c; dr.chips = dr.chips.includes(c) ? dr.chips.filter(x => x !== c) : [...dr.chips, c]; renderDraft(); break; }
+    case 'same': useSaved(dr.sameAs); toast('Usando los valores guardados'); break;
+    case 'notsame': dr.sameAs = null; dr.declined = true; renderDraft(); break;
     case 'runtext': { const t = $('#dText').value.trim(); if (!t) { toast('Escribe qué has comido.'); return; } dr.text = t; setPending(null); analyzeAI(); break; }
     case 'retry': analyzeAI(); break;
     case 'stopai': dr?.ctl?.abort(); break;
