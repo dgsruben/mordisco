@@ -304,8 +304,11 @@ async function gemModels(signal) {
   const p = S.profile;
   if (p.aiModels && Date.now() - p.aiModels.at < 3 * 864e5) return p.aiModels;
   let res;
-  try { res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': p.geminiKey }, signal }); }
-  catch (e) { if (e.name === 'AbortError') throw { code: 'cancelled' }; return GEM_MODELS; }
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 8000), stop = () => ctl.abort();
+  signal?.addEventListener('abort', stop);
+  try { res = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': p.geminiKey }, signal: ctl.signal }); }
+  catch { if (signal?.aborted) throw { code: 'cancelled' }; return GEM_MODELS; }
+  finally { clearTimeout(t); signal?.removeEventListener('abort', stop); }
   if (res.status === 401 || res.status === 403) throw { code: 'badkey' };
   if (!res.ok) { const b = await res.json().catch(() => ({})); if (/api key/i.test(b.error?.message || '')) throw { code: 'badkey' }; return GEM_MODELS; }
   const j = await res.json().catch(() => ({}));
@@ -332,29 +335,46 @@ function parseJSONLoose(t) {
 async function gemini(parts, { json = true, signal, precise = S.profile.aiPrecise } = {}) {
   const key = S.profile.geminiKey; if (!key) throw { code: 'nokey' };
   let lastErr = { code: 'http' };
+  const p = S.profile, mode = precise ? 'precise' : 'fast';
   const list = await gemModels(signal);
+  // the model that answered last time goes first; models that failed recently are skipped for a while
+  const ok = p.aiOk?.[mode], skip = p.aiSkip || {}, now = Date.now();
+  let order = list[mode].filter(m => !(skip[m] > now));
+  if (ok && order.includes(ok)) order = [ok, ...order.filter(m => m !== ok)];
+  if (!order.length) order = list[mode];
+  const bench = (m, ms) => { p.aiSkip = { ...(p.aiSkip || {}), [m]: Date.now() + ms }; saveProfile(); };
   S.tried = [];
-  for (const model of precise ? list.precise : list.fast) {
-    S.tried.push(model);
-    let res;
+  for (const model of order) {
+    if (signal?.aborted) throw { code: 'cancelled' };
+    S.tried.push(model); S.trying = model;
+    const ctl = new AbortController(), stop = () => ctl.abort();
+    signal?.addEventListener('abort', stop);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, /pro/.test(model) ? 40000 : 30000);
     try {
-      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-        method: 'POST', signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
         body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.2, ...(json ? { responseMimeType: 'application/json' } : {}) } })
       });
-    } catch (e) { throw { code: e.name === 'AbortError' ? 'cancelled' : 'network' }; }
-    if (res.ok) {
-      const j = await res.json();
-      const text = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
-      if (!text) { lastErr = { code: 'empty' }; continue; }
-      S.lastModel = model;
-      return json ? parseJSONLoose(text) : text;
-    }
-    const body = await res.json().catch(() => ({}));
-    const msg = body.error?.message || '';
-    if (res.status === 403 || (res.status === 400 && /api key/i.test(msg))) throw { code: 'badkey' };
-    lastErr = { code: res.status === 429 ? 'quota' : res.status === 404 ? 'nomodel' : 'http', msg };
-    // 404 (model not available), 429 (quota for this model) or 5xx: try the next model
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) {
+        const text = (body.candidates?.[0]?.content?.parts || []).filter(x => !x.thought).map(x => x.text || '').join('');
+        if (!text) { lastErr = { code: 'empty' }; continue; }
+        S.lastModel = model;
+        if (p.aiOk?.[mode] !== model) { p.aiOk = { ...(p.aiOk || {}), [mode]: model }; saveProfile(); }
+        return json ? parseJSONLoose(text) : text;
+      }
+      const msg = body.error?.message || '';
+      if (res.status === 403 || (res.status === 400 && /api key/i.test(msg))) throw { code: 'badkey' };
+      lastErr = { code: res.status === 429 ? 'quota' : res.status === 404 ? 'nomodel' : 'http', msg };
+      if (res.status === 429 || res.status === 404) bench(model, 12 * 3600e3);
+      // 404 (model not available), 429 (quota for this model) or 5xx: try the next model
+    } catch (e) {
+      if (e.code) throw e;
+      if (signal?.aborted) throw { code: 'cancelled' };
+      if (timedOut) { lastErr = { code: 'timeout' }; bench(model, 6 * 3600e3); continue; }
+      throw { code: 'network' };
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', stop); }
   }
   if (lastErr.code === 'nomodel') { S.profile.aiModels = null; saveProfile(); }   // re-read Google's list next time
   throw lastErr;
@@ -366,6 +386,7 @@ function aiError(e) {
     quota: 'Se ha acabado la cuota gratis de Gemini por ahora. Usa ChatGPT o prueba en un rato.',
     network: 'Sin conexión con Gemini. Revisa internet.',
     badjson: 'La respuesta salió mal formada. Reintenta.',
+    timeout: 'Gemini no ha respondido a tiempo. Reintenta (ahora irá directo al modelo rápido) o usa ChatGPT.',
     empty: 'Gemini no ha devuelto nada. Reintenta o descríbelo con texto.',
     nomodel: 'Google no ha aceptado ningún modelo con tu clave. Toca Probar otra vez en un minuto; si sigue, revisa que la clave sea de aistudio.google.com.'
   })[e?.code] || 'Algo ha fallado con Gemini. Reintenta o usa ChatGPT.';
@@ -398,8 +419,9 @@ async function analyzeAI(fix) {
   dr.ctl?.abort(); const ctl = new AbortController(); dr.ctl = ctl;
   try {
     const parts = [{ text: aiPrompt(dr, fix) }];
-    if (dr.file) { dr.b64 ||= await blobToB64(await shrinkImage(dr.file, 1280)); parts.push({ inline_data: { mime_type: 'image/jpeg', data: dr.b64 } }); }
-    const res = await gemini(parts, { signal: ctl.signal });
+    if (dr.file) { dr.b64 ||= await blobToB64(await shrinkImage(dr.file, 1024)); parts.push({ inline_data: { mime_type: 'image/jpeg', data: dr.b64 } }); }
+    dr.started = Date.now();
+    const res = await gemini(parts, { signal: ctl.signal, precise: S.profile.aiPrecise && !dr.forceFast });
     if (S.draft !== dr) return;
     const items = (Array.isArray(res?.items) ? res.items : []).map(it => ({ name: String(it.name || 'Alimento'), grams: R(num(it.grams)), kcal: R(num(it.kcal)), p: +num(it.p).toFixed(1), c: +num(it.c).toFixed(1), f: +num(it.f).toFixed(1), fib: +num(it.fib).toFixed(1), sug: +num(it.sug).toFixed(1), na: R(num(it.na)) }));
     if (!items.length) { dr.status = 'error'; dr.error = res?.notes ? String(res.notes) : 'No veo comida. Prueba otra foto o descríbelo.'; renderDraft(); return; }
@@ -409,7 +431,7 @@ async function analyzeAI(fix) {
     if (!fix && res.same_as && !dr.declined) { const i = S.profile.recent.findIndex(r => r.name.toLowerCase() === String(res.same_as).toLowerCase().trim()); if (i >= 0) dr.sameAs = i; }
     if (dr.file) setPending(null);
   } catch (e) {
-    if (S.draft !== dr) return;
+    if (S.draft !== dr || dr.ctl !== ctl) return;   // closed, or replaced by a newer attempt
     dr.status = dr.items?.length ? 'ready' : 'error'; dr.error = e.code === 'cancelled' ? 'Cancelado.' : aiError(e);
     if (dr.status === 'ready' && e.code !== 'cancelled') toast(dr.error);
   }
@@ -1012,9 +1034,16 @@ function renderDraft() {
       <button class="btn ${same ? 'soft' : 'solid'} block" data-act="runphoto">Analizar</button>
       <div class="row"><button class="btn sm ghost" data-act="tochatgpt">Usar ChatGPT</button><button class="btn sm ghost" data-act="close">Cancelar</button></div>`;
   } else if (dr.status === 'loading') {
-    body = `${img}<div class="loading"><div class="spin"></div><b id="loadMsg">${LOAD_MSGS[0]}</b><span class="note">${S.profile.aiPrecise ? 'Modo preciso: suele tardar 10-30 segundos.' : 'Unos segundos…'}</span><button class="btn sm ghost" data-act="stopai">Cancelar</button></div>`;
+    body = `${img}<div class="loading"><div class="spin"></div><b id="loadMsg">${LOAD_MSGS[0]}</b><span class="note" id="loadSec">0 s</span>
+      <div class="row" style="justify-content:center"><button class="btn sm soft" data-act="gofast" id="goFast" hidden>Tarda mucho: hazlo rápido</button><button class="btn sm ghost" data-act="stopai">Cancelar</button></div></div>`;
     let i = 0; clearInterval(renderDraft.iv);
-    renderDraft.iv = setInterval(() => { const el = $('#loadMsg'); if (!el || S.draft?.status !== 'loading') return clearInterval(renderDraft.iv); el.textContent = LOAD_MSGS[++i % LOAD_MSGS.length]; }, 3500);
+    renderDraft.iv = setInterval(() => {
+      const el = $('#loadMsg'); if (!el || S.draft?.status !== 'loading') return clearInterval(renderDraft.iv);
+      const s = R((Date.now() - (S.draft.started || Date.now())) / 1000);
+      if (s % 3 === 0) el.textContent = LOAD_MSGS[++i % LOAD_MSGS.length];
+      $('#loadSec').textContent = `${s} s${S.trying ? ' · ' + S.trying : ''}`;
+      if (s >= 15 && !S.draft.forceFast) $('#goFast').hidden = false;
+    }, 1000);
   } else if (dr.status === 'error') {
     body = `${img}<div class="err">${esc(dr.error)}</div>
       <div class="row">${hasAI() && (dr.file || dr.text) ? '<button class="btn solid" data-act="retry">Reintentar</button>' : ''}${dr.file ? '<button class="btn soft" data-act="tochatgpt">Usar ChatGPT</button>' : ''}<button class="btn soft" data-act="manual">A mano</button></div>
@@ -1116,6 +1145,7 @@ document.addEventListener('click', e => {
     case 'runtext': { const t = $('#dText').value.trim(); if (!t) { toast('Escribe qué has comido.'); return; } dr.text = t; setPending(null); analyzeAI(); break; }
     case 'retry': analyzeAI(); break;
     case 'stopai': dr?.ctl?.abort(); break;
+    case 'gofast': if (dr) { dr.forceFast = true; dr.ctl?.abort(); setTimeout(() => S.draft === dr && analyzeAI(), 50); } break;
     case 'tochatgpt': dr.status = 'photo'; renderDraft(); break;
     case 'aians': { const q = dr.questions[+a.dataset.i]; analyzeAI(`${q} → ${a.dataset.a}`); break; }
     case 'aifix': { const f = $('#dFix').value.trim(); if (!f) { toast('Escribe qué hay que corregir.'); return; } analyzeAI(f); break; }
